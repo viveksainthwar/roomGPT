@@ -3,92 +3,111 @@ import redis from "../../utils/redis";
 import { NextResponse } from "next/server";
 import { headers } from "next/headers";
 
-// Create a new ratelimiter, that allows 5 requests per 24 hours
+// Rate limit: 5 requests / 24 hours
 const ratelimit = redis
   ? new Ratelimit({
-      redis: redis,
+      redis,
       limiter: Ratelimit.fixedWindow(5, "1440 m"),
       analytics: true,
     })
   : undefined;
 
 export async function POST(request: Request) {
-  // Rate Limiter Code
-  if (ratelimit) {
-    const headersList = headers();
-    const ipIdentifier = headersList.get("x-real-ip");
+  try {
+    // Rate limit check
+    if (ratelimit) {
+      const headersList = headers();
+      const ipIdentifier = headersList.get("x-real-ip") ?? "unknown-ip";
+      const result = await ratelimit.limit(ipIdentifier);
 
-    const result = await ratelimit.limit(ipIdentifier ?? "");
-
-    if (!result.success) {
-      return new Response(
-        "Too many uploads in 1 day. Please try again in a 24 hours.",
-        {
-          status: 429,
-          headers: {
-            "X-RateLimit-Limit": result.limit,
-            "X-RateLimit-Remaining": result.remaining,
-          } as any,
-        }
-      );
+      if (!result.success) {
+        return NextResponse.json(
+          { error: "Too many uploads in 1 day. Please try again in 24 hours." },
+          {
+            status: 429,
+            headers: {
+              "X-RateLimit-Limit": result.limit.toString(),
+              "X-RateLimit-Remaining": result.remaining.toString(),
+            },
+          }
+        );
+      }
     }
-  }
 
-  const { imageUrl, theme, room } = await request.json();
+    const { imageUrl, theme, room } = await request.json();
 
-  // POST request to Replicate to start the image restoration generation process
-  let startResponse = await fetch("https://api.replicate.com/v1/predictions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: "Token " + process.env.REPLICATE_API_KEY,
-    },
-    body: JSON.stringify({
-      version:
-        "854e8727697a057c525cdb45ab037f64ecca770a1769cc52287c2e56472a247b",
-      input: {
-        image: imageUrl,
-        prompt:
-          room === "Gaming Room"
-            ? "a room for gaming with gaming computers, gaming consoles, and gaming chairs"
-            : `a ${theme.toLowerCase()} ${room.toLowerCase()}`,
-        a_prompt:
-          "best quality, extremely detailed, photo from Pinterest, interior, cinematic photo, ultra-detailed, ultra-realistic, award-winning",
-        n_prompt:
-          "longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality",
-      },
-    }),
-  });
+    const prompt =
+      room === "Gaming Room"
+        ? "a room for gaming with gaming computers, gaming consoles, and gaming chairs"
+        : `a ${theme.toLowerCase()} ${room.toLowerCase()}`;
 
-  let jsonStartResponse = await startResponse.json();
-
-  let endpointUrl = jsonStartResponse.urls.get;
-
-  // GET request to get the status of the image restoration process & return the result when it's ready
-  let restoredImage: string | null = null;
-  while (!restoredImage) {
-    // Loop in 1s intervals until the alt text is ready
-    console.log("polling for result...");
-    let finalResponse = await fetch(endpointUrl, {
-      method: "GET",
+    // Start Replicate Prediction
+    const startResponse = await fetch("https://api.replicate.com/v1/predictions", {
+      method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: "Token " + process.env.REPLICATE_API_KEY,
+        Authorization: `Token ${process.env.REPLICATE_API_KEY}`,
       },
+      body: JSON.stringify({
+        version: "854e8727697a057c525cdb45ab037f64ecca770a1769cc52287c2e56472a247b",
+        input: {
+          image: imageUrl,
+          prompt,
+          a_prompt: "best quality, extremely detailed, photo from Pinterest, interior, cinematic photo, ultra-detailed, ultra-realistic, award-winning",
+          n_prompt: "longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality",
+        },
+      }),
     });
-    let jsonFinalResponse = await finalResponse.json();
 
-    if (jsonFinalResponse.status === "succeeded") {
-      restoredImage = jsonFinalResponse.output;
-    } else if (jsonFinalResponse.status === "failed") {
-      break;
-    } else {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (!startResponse.ok) {
+      const errorText = await startResponse.text();
+      console.error("Start Replicate error:", errorText);
+      return NextResponse.json({ error: "Replicate API start failed" }, { status: 500 });
     }
-  }
 
-return NextResponse.json(
-  restoredImage
-    ? { image: restoredImage }
-    : { error: "Failed to restore image" }
-);
+    const jsonStartResponse = await startResponse.json();
+    const endpointUrl = jsonStartResponse.urls?.get;
+
+    if (!endpointUrl) {
+      return NextResponse.json({ error: "Replicate response missing endpoint URL" }, { status: 500 });
+    }
+
+    // Polling loop
+    let restoredImage: string | null = null;
+    let attempts = 0;
+    const maxAttempts = 30;
+
+    while (!restoredImage && attempts < maxAttempts) {
+      console.log("Polling for result...");
+      const finalResponse = await fetch(endpointUrl, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Token ${process.env.REPLICATE_API_KEY}`,
+        },
+      });
+
+      const jsonFinalResponse = await finalResponse.json();
+
+      if (jsonFinalResponse.status === "succeeded") {
+        restoredImage = jsonFinalResponse.output;
+        break;
+      } else if (jsonFinalResponse.status === "failed") {
+        return NextResponse.json({ error: "Image generation failed" }, { status: 500 });
+      }
+
+      await new Promise((r) => setTimeout(r, 1000));
+      attempts++;
+    }
+
+    if (!restoredImage) {
+      return NextResponse.json({ error: "Image generation timeout" }, { status: 504 });
+    }
+
+    return NextResponse.json({ image: restoredImage });
+
+  } catch (error) {
+    console.error("Unexpected error in /generate:", error);
+    return NextResponse.json({ error: "Unexpected server error" }, { status: 500 });
+  }
+}
