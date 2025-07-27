@@ -87,7 +87,8 @@ export async function POST(request: Request) {
     }
   }
 
-  return NextResponse.json(
-    restoredImage ? restoredImage : "Failed to restore image"
-  );
-}
+return NextResponse.json(
+  restoredImage
+    ? { image: restoredImage }
+    : { error: "Failed to restore image" }
+);
