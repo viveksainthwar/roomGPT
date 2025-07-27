@@ -14,7 +14,7 @@ const ratelimit = redis
 
 export async function POST(request: Request) {
   try {
-    // Rate limit check
+    // ✅ 1. Rate limiting
     if (ratelimit) {
       const headersList = headers();
       const ipIdentifier = headersList.get("x-real-ip") ?? "unknown-ip";
@@ -34,14 +34,19 @@ export async function POST(request: Request) {
       }
     }
 
+    // ✅ 2. Parse incoming JSON
     const { imageUrl, theme, room } = await request.json();
+
+    if (!imageUrl || !theme || !room) {
+      return NextResponse.json({ error: "Missing required parameters." }, { status: 400 });
+    }
 
     const prompt =
       room === "Gaming Room"
         ? "a room for gaming with gaming computers, gaming consoles, and gaming chairs"
         : `a ${theme.toLowerCase()} ${room.toLowerCase()}`;
 
-    // Start Replicate Prediction
+    // ✅ 3. Start Replicate prediction
     const startResponse = await fetch("https://api.replicate.com/v1/predictions", {
       method: "POST",
       headers: {
@@ -53,32 +58,39 @@ export async function POST(request: Request) {
         input: {
           image: imageUrl,
           prompt,
-          a_prompt: "best quality, extremely detailed, photo from Pinterest, interior, cinematic photo, ultra-detailed, ultra-realistic, award-winning",
-          n_prompt: "longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality",
+          a_prompt:
+            "best quality, extremely detailed, photo from Pinterest, interior, cinematic photo, ultra-detailed, ultra-realistic, award-winning",
+          n_prompt:
+            "longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality",
         },
       }),
     });
 
     if (!startResponse.ok) {
       const errorText = await startResponse.text();
-      console.error("Start Replicate error:", errorText);
-      return NextResponse.json({ error: "Replicate API start failed" }, { status: 500 });
+      console.error("🔴 Replicate Start API Error:", errorText);
+      return NextResponse.json(
+        { error: "Replicate API start failed" },
+        { status: 500 }
+      );
     }
 
     const jsonStartResponse = await startResponse.json();
-    const endpointUrl = jsonStartResponse.urls?.get;
+    const endpointUrl = jsonStartResponse?.urls?.get;
 
     if (!endpointUrl) {
-      return NextResponse.json({ error: "Replicate response missing endpoint URL" }, { status: 500 });
+      return NextResponse.json(
+        { error: "Replicate response missing endpoint URL" },
+        { status: 500 }
+      );
     }
 
-    // Polling loop
+    // ✅ 4. Poll until the image is ready
     let restoredImage: string | null = null;
     let attempts = 0;
     const maxAttempts = 30;
 
     while (!restoredImage && attempts < maxAttempts) {
-      console.log("Polling for result...");
       const finalResponse = await fetch(endpointUrl, {
         method: "GET",
         headers: {
@@ -93,21 +105,33 @@ export async function POST(request: Request) {
         restoredImage = jsonFinalResponse.output;
         break;
       } else if (jsonFinalResponse.status === "failed") {
-        return NextResponse.json({ error: "Image generation failed" }, { status: 500 });
+        console.error("🔴 Replicate returned failed status.");
+        return NextResponse.json(
+          { error: "Image generation failed" },
+          { status: 500 }
+        );
       }
 
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise((res) => setTimeout(res, 1000));
       attempts++;
     }
 
+    // ✅ 5. Timeout condition
     if (!restoredImage) {
-      return NextResponse.json({ error: "Image generation timeout" }, { status: 504 });
+      console.error("🕒 Image generation timed out.");
+      return NextResponse.json(
+        { error: "Image generation timed out." },
+        { status: 504 }
+      );
     }
 
+    // ✅ 6. Success!
     return NextResponse.json({ image: restoredImage });
-
-  } catch (error) {
-    console.error("Unexpected error in /generate:", error);
-    return NextResponse.json({ error: "Unexpected server error" }, { status: 500 });
+  } catch (error: any) {
+    console.error("🚨 Unexpected error in /generate:", error);
+    return NextResponse.json(
+      { error: "Unexpected server error", detail: error?.message || null },
+      { status: 500 }
+    );
   }
 }
